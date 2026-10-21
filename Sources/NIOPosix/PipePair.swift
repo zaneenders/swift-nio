@@ -159,6 +159,20 @@ final class PipePair: SocketProtocol {
         #endif
     }
 
+    #if os(Linux)
+    func receiveFileDescriptors(
+        pointer: UnsafeMutableRawBufferPointer
+    ) throws -> (IOResult<Int>, [NIOUnixDomainSocketDescriptor]) {
+        throw ChannelError.operationUnsupported
+    }
+    func sendFileDescriptors(
+        pointer: UnsafeRawBufferPointer,
+        descriptors: [NIOUnixDomainSocketDescriptor]
+    ) throws -> IOResult<Int> {
+        throw ChannelError.operationUnsupported
+    }
+    #endif
+
     func recvmsg(
         pointer: UnsafeMutableRawBufferPointer,
         storage: inout sockaddr_storage,

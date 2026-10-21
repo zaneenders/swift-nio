@@ -18,6 +18,7 @@ import NIOCore
 
 class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>, @unchecked Sendable {
     internal var connectTimeoutScheduled: Optional<Scheduled<Void>>
+    private var receiveFileDescriptors: Bool = false
     private var allowRemoteHalfClosure: Bool = false
     private var inputShutdown: Bool = false
     private var outputShutdown: Bool = false
@@ -54,6 +55,15 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
         }
 
         switch option {
+        case _ as ChannelOptions.Types.ReceiveFileDescriptors:
+            #if os(Linux)
+            if value as! Bool {
+                guard try self.socket.localAddress().protocol == .unix else { throw ChannelError.operationUnsupported }
+            }
+            self.receiveFileDescriptors = value as! Bool
+            #else
+            throw ChannelError.operationUnsupported
+            #endif
         case _ as ChannelOptions.Types.AllowRemoteHalfClosureOption:
             self.allowRemoteHalfClosure = value as! Bool
         case _ as ChannelOptions.Types.WriteSpinOption:
@@ -73,6 +83,8 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
         }
 
         switch option {
+        case _ as ChannelOptions.Types.ReceiveFileDescriptors:
+            return self.receiveFileDescriptors as! Option.Value
         case _ as ChannelOptions.Types.AllowRemoteHalfClosureOption:
             return self.allowRemoteHalfClosure as! Option.Value
         case _ as ChannelOptions.Types.WriteSpinOption:
@@ -120,9 +132,17 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
                 throw ChannelError._eof
             }
 
+            var receivedDescriptors: [NIOUnixDomainSocketDescriptor] = []
             let (buffer, readResult) = try self.recvBufferPool.buffer(allocator: self.allocator) { buffer in
                 try buffer.withMutableWritePointer { pointer in
-                    try self.socket.read(pointer: pointer)
+                    #if os(Linux)
+                    if self.receiveFileDescriptors {
+                        let (result, descriptors) = try self.socket.receiveFileDescriptors(pointer: pointer)
+                        receivedDescriptors = descriptors
+                        return result
+                    }
+                    #endif
+                    return try self.socket.read(pointer: pointer)
                 }
             }
 
@@ -135,7 +155,13 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
                     self.readPending = false
 
                     assert(self.isActive)
-                    self.pipeline.syncOperations.fireChannelRead(NIOAny(buffer))
+                    if self.receiveFileDescriptors {
+                        self.pipeline.syncOperations.fireChannelRead(
+                            NIOAny(NIOUnixDomainSocketMessage(data: buffer, descriptors: receivedDescriptors))
+                        )
+                    } else {
+                        self.pipeline.syncOperations.fireChannelRead(NIOAny(buffer))
+                    }
                     result = .some
 
                     if buffer.writableBytes > 0 {
@@ -165,6 +191,13 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
 
     final override func writeToSocket() throws -> OverallWriteResult {
         let result = try self.pendingWrites.triggerAppropriateWriteOperations(
+            descriptorWriteOperation: { pointer, descriptors in
+                #if os(Linux)
+                return try self.socket.sendFileDescriptors(pointer: pointer, descriptors: descriptors)
+                #else
+                throw ChannelError.operationUnsupported
+                #endif
+            },
             scalarBufferWriteOperation: { ptr in
                 guard ptr.count > 0 else {
                     // No need to call write if the buffer is empty.
@@ -294,6 +327,17 @@ class BaseStreamSocketChannel<Socket: SocketProtocol>: BaseSocketChannel<Socket>
     final override func bufferPendingWrite(data: NIOAny, promise: EventLoopPromise<Void>?) {
         if self.outputShutdown {
             promise?.fail(ChannelError._outputClosed)
+            return
+        }
+
+        if let message = self.tryUnwrapData(data, as: NIOUnixDomainSocketMessage.self) {
+            guard self.receiveFileDescriptors, !message.data.readableBytesView.isEmpty else {
+                promise?.fail(ChannelError.operationUnsupported)
+                return
+            }
+            if !self.pendingWrites.add(message: message, promise: promise) {
+                self.pipeline.syncOperations.fireChannelWritabilityChanged()
+            }
             return
         }
 

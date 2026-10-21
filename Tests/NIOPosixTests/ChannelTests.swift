@@ -14,11 +14,11 @@
 
 import Dispatch
 import NIOConcurrencyHelpers
-@_spi(CustomByteBufferAllocator) @testable import NIOCore
 import NIOEmbedded
 import NIOTestUtils
 import XCTest
 
+@_spi(CustomByteBufferAllocator) @testable import NIOCore
 @testable import NIOPosix
 
 #if os(Linux)
@@ -501,6 +501,80 @@ final class ChannelTests: XCTestCase {
             }
         }
         return result
+    }
+
+    /// Ancillary descriptors stay attached to their write and transfer only with its first successful byte.
+    func testDescriptorWritesDoNotVectorAcrossAncillaryBoundaryOrResendAfterPartialWrite() throws {
+        try self.withPendingStreamWritesManager { manager in
+            var bytes = ByteBufferAllocator().buffer(capacity: 4)
+            bytes.writeString("abcd")
+            let descriptor = NIOUnixDomainSocketDescriptor(takingOwnershipOf: -1)
+            _ = manager.add(data: .byteBuffer(bytes), promise: nil)
+            _ = manager.add(message: NIOUnixDomainSocketMessage(data: bytes, descriptors: [descriptor]), promise: nil)
+            _ = manager.add(data: .byteBuffer(bytes), promise: nil)
+            manager.markFlushCheckpoint()
+            var fdCalls = 0
+            var ordinaryBytes = 0
+            _ = try manager.triggerAppropriateWriteOperations(
+                descriptorWriteOperation: { buffer, fds in
+                    fdCalls += 1
+                    XCTAssertEqual(fds.count, 1)
+                    XCTAssertEqual(buffer.count, 4)
+                    return .processed(1)
+                },
+                scalarBufferWriteOperation: { buffer in
+                    ordinaryBytes += buffer.count
+                    return .processed(buffer.count)
+                },
+                vectorBufferWriteOperation: { vectors in
+                    let count = vectors.reduce(0) { $0 + Int($1.iov_len) }
+                    ordinaryBytes += count
+                    return .processed(count)
+                },
+                scalarFileWriteOperation: { _, _, _ in
+                    XCTFail()
+                    return .wouldBlock(0)
+                }
+            )
+            XCTAssertEqual(fdCalls, 1)
+            XCTAssertEqual(ordinaryBytes, 11)
+        }
+    }
+
+    func testDescriptorWritesPreserveAncillaryDataAfterWouldBlock() throws {
+        try self.withPendingStreamWritesManager { manager in
+            var bytes = ByteBufferAllocator().buffer(capacity: 4)
+            bytes.writeString("abcd")
+            let descriptor = NIOUnixDomainSocketDescriptor(takingOwnershipOf: -1)
+            _ = manager.add(message: NIOUnixDomainSocketMessage(data: bytes, descriptors: [descriptor]), promise: nil)
+            manager.markFlushCheckpoint()
+            var calls = 0
+            for blocked in [true, false] {
+                _ = try manager.triggerAppropriateWriteOperations(
+                    descriptorWriteOperation: { buffer, descriptors in
+                        calls += 1
+                        XCTAssertEqual(descriptors.count, 1)
+                        XCTAssertTrue(descriptors[0] === descriptor)
+                        XCTAssertEqual(buffer.count, 4)
+                        return blocked ? .wouldBlock(0) : .processed(buffer.count)
+                    },
+                    scalarBufferWriteOperation: { _ in
+                        XCTFail("Descriptor write became an ordinary write")
+                        return .wouldBlock(0)
+                    },
+                    vectorBufferWriteOperation: { _ in
+                        XCTFail("Descriptor write became a vector write")
+                        return .wouldBlock(0)
+                    },
+                    scalarFileWriteOperation: { _, _, _ in
+                        XCTFail()
+                        return .wouldBlock(0)
+                    }
+                )
+                XCTAssertEqual(manager.bufferedBytes, blocked ? 4 : 0)
+            }
+            XCTAssertEqual(calls, 2)
+        }
     }
 
     /// Tests that writes of empty buffers work correctly and that we don't accidentally write buffers that haven't been flushed.

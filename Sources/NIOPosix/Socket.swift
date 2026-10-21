@@ -16,6 +16,7 @@
 
 import CNIOLinux
 import CNIOOpenBSD
+import CNIOPosix
 import NIOCore
 
 #if canImport(WinSDK)
@@ -235,6 +236,52 @@ class Socket: BaseSocket, SocketProtocol {
             #endif
         }
     }
+
+    #if os(Linux)
+    func receiveFileDescriptors(
+        pointer: UnsafeMutableRawBufferPointer
+    ) throws -> (IOResult<Int>, [NIOUnixDomainSocketDescriptor]) {
+        try self.withUnsafeHandle { fd in
+            var fds = [CInt](repeating: -1, count: 256)
+            var count = fds.count
+            let result = c_nio_receive_fds(fd, pointer.baseAddress, pointer.count, &fds, &count)
+            if result < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK { return (.wouldBlock(0), []) }
+                if errno == EINTR { return (.wouldBlock(0), []) }
+                throw IOError(errnoCode: errno, reason: "recvmsg SCM_RIGHTS")
+            }
+            return (.processed(result), fds.prefix(count).map { NIOUnixDomainSocketDescriptor(takingOwnershipOf: $0) })
+        }
+    }
+
+    func sendFileDescriptors(
+        pointer: UnsafeRawBufferPointer,
+        descriptors: [NIOUnixDomainSocketDescriptor]
+    ) throws -> IOResult<Int> {
+        guard descriptors.count <= 256 else {
+            throw IOError(errnoCode: EMSGSIZE, reason: "too many SCM_RIGHTS descriptors")
+        }
+        return try self.withUnsafeHandle { fd in
+            // Hold stable copies across sendmsg even if another owner concurrently closes its wrapper.
+            var fds: [CInt] = []
+            defer { for descriptor in fds { _ = Glibc.close(descriptor) } }
+            for descriptor in descriptors {
+                let copy = try descriptor.withUnsafeFileDescriptor { raw in
+                    let copy = fcntl(raw, F_DUPFD_CLOEXEC, 0)
+                    guard copy >= 0 else { throw IOError(errnoCode: errno, reason: "duplicate SCM_RIGHTS descriptor") }
+                    return copy
+                }
+                fds.append(copy)
+            }
+            let result = c_nio_send_fds(fd, pointer.baseAddress, pointer.count, fds, fds.count)
+            if result < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { return .wouldBlock(0) }
+                throw IOError(errnoCode: errno, reason: "sendmsg SCM_RIGHTS")
+            }
+            return .processed(result)
+        }
+    }
+    #endif
 
     /// Receive data from the socket, along with aditional control information.
     ///

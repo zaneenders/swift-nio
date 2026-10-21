@@ -35,3 +35,10 @@ static inline void * c_nio_posix_get_el_ptr(void) {
 static inline void c_nio_posix_set_el_ptr(void *id) {
     _c_nio_posix_thread_local_el_ptr = id;
 }
+
+#if defined(__linux__)
+#include <stddef.h>
+#include <sys/types.h>
+ssize_t c_nio_receive_fds(int socket, void *bytes, size_t capacity, int *fds, size_t *fd_count);
+ssize_t c_nio_send_fds(int socket, const void *bytes, size_t count, const int *fds, size_t fd_count);
+#endif

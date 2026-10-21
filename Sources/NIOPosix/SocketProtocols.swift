@@ -55,6 +55,16 @@ protocol SocketProtocol: BaseSocketProtocol {
 
     func read(pointer: UnsafeMutableRawBufferPointer) throws -> IOResult<Int>
 
+    #if os(Linux)
+    func receiveFileDescriptors(
+        pointer: UnsafeMutableRawBufferPointer
+    ) throws -> (IOResult<Int>, [NIOUnixDomainSocketDescriptor])
+    func sendFileDescriptors(
+        pointer: UnsafeRawBufferPointer,
+        descriptors: [NIOUnixDomainSocketDescriptor]
+    ) throws -> IOResult<Int>
+    #endif
+
     func recvmsg(
         pointer: UnsafeMutableRawBufferPointer,
         storage: inout sockaddr_storage,
