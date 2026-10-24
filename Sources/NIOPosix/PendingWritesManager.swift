@@ -22,6 +22,7 @@ import NIOCore
 private struct PendingStreamWrite {
     var data: IOData
     var promise: Optional<EventLoopPromise<Void>>
+    var descriptors: [NIOUnixDomainSocketDescriptor] = []
 }
 
 /// Write result is `.couldNotWriteEverything` but we have no more writes to perform.
@@ -59,6 +60,7 @@ private func doPendingWriteVectorOperation(
 
         loop: for i in 0..<count {
             let p = pending[i]
+            if !p.descriptors.isEmpty { break loop }
             switch p.data {
             case .byteBuffer(let buffer):
                 // Must not write more than Int32.max in one go.
@@ -181,6 +183,8 @@ private struct PendingStreamWritesState {
     /// - Parameters:
     ///   - bytes: How many bytes of the item were written.
     private mutating func partiallyWrittenFirst(bytes: Int) {
+        // SCM_RIGHTS is sent once, on the first successful byte; EAGAIN preserves ownership.
+        if bytes > 0 { self.pendingWrites[self.pendingWrites.startIndex].descriptors.removeAll() }
         self.pendingWrites[self.pendingWrites.startIndex].data.moveReaderIndex(forwardBy: bytes)
         self.subtractOutstanding(bytes: bytes)
     }
@@ -298,6 +302,7 @@ private struct PendingStreamWritesState {
 
     /// Returns the best mechanism to write pending data at the current point in time.
     var currentBestWriteMechanism: WriteMechanism {
+        if self.flushedChunks > 0, !self.pendingWrites.first!.descriptors.isEmpty { return .scalarBufferWrite }
         switch self.flushedChunks {
         case 0:
             return .nothingToBeWritten
@@ -368,11 +373,16 @@ final class PendingStreamWritesManager: PendingWritesManager {
     ///
     /// - Parameters:
     ///   - data: The `IOData` to write.
+    ///   - descriptors: Descriptors to transfer with the first byte of this write.
     ///   - promise: Optionally an `EventLoopPromise` that will get the write operation's result
     /// - result: If the `Channel` is still writable after adding the write of `data`.
-    func add(data: IOData, promise: EventLoopPromise<Void>?) -> Bool {
+    func add(
+        data: IOData,
+        descriptors: [NIOUnixDomainSocketDescriptor] = [],
+        promise: EventLoopPromise<Void>?
+    ) -> Bool {
         assert(self.isOpen)
-        self.state.append(PendingStreamWrite(data: data, promise: promise))
+        self.state.append(PendingStreamWrite(data: data, promise: promise, descriptors: descriptors))
 
         if self.state.bytes > waterMark.high
             && channelWritabilityFlag.compareExchange(expected: true, desired: false, ordering: .relaxed).exchanged
@@ -393,11 +403,14 @@ final class PendingStreamWritesManager: PendingWritesManager {
     /// `sendfile`.
     ///
     /// - Parameters:
+    ///   - descriptorWriteOperation: An operation that writes bytes and their associated file descriptors.
     ///   - scalarBufferWriteOperation: An operation that writes a single, contiguous array of bytes (usually `write`).
     ///   - vectorBufferWriteOperation: An operation that writes multiple contiguous arrays of bytes (usually `writev`).
     ///   - scalarFileWriteOperation: An operation that writes a region of a file descriptor (usually `sendfile`).
     /// - Returns: The `OneWriteOperationResult` and whether the `Channel` is now writable.
     func triggerAppropriateWriteOperations(
+        descriptorWriteOperation: ((UnsafeRawBufferPointer, [NIOUnixDomainSocketDescriptor]) throws -> IOResult<Int>)? =
+            nil,
         scalarBufferWriteOperation: (UnsafeRawBufferPointer) throws -> IOResult<Int>,
         vectorBufferWriteOperation: (UnsafeBufferPointer<IOVector>) throws -> IOResult<Int>,
         scalarFileWriteOperation: (CInt, Int, Int) throws -> IOResult<Int>
@@ -405,6 +418,11 @@ final class PendingStreamWritesManager: PendingWritesManager {
         try self.triggerWriteOperations { writeMechanism in
             switch writeMechanism {
             case .scalarBufferWrite:
+                let descriptors = self.state[0].descriptors
+                if !descriptors.isEmpty {
+                    guard let descriptorWriteOperation else { throw ChannelError.operationUnsupported }
+                    return try triggerScalarBufferWrite({ try descriptorWriteOperation($0, descriptors) })
+                }
                 return try triggerScalarBufferWrite({ try scalarBufferWriteOperation($0) })
             case .vectorBufferWrite:
                 return try triggerVectorBufferWrite({ try vectorBufferWriteOperation($0) })
