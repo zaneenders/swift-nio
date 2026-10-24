@@ -13,9 +13,16 @@
 //===----------------------------------------------------------------------===//
 
 import CNIOLinux
+import NIOCore
 import XCTest
 
 @testable import NIOPosix
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 // This file constructs POSIX msghdr and UnsafeControlMessageCollection
 // throughout, which are unsupported on Windows.
@@ -99,6 +106,82 @@ class ControlMessageTests: XCTestCase {
         }
         XCTAssertEqual(expected, decoded)
     }
+
+    #if os(Linux)
+    func testFileDescriptorEncodingSharesControlMessageLayout() {
+        self.encoder.appendControlMessage(level: CInt(IPPROTO_IP), type: IP_TOS, payload: 2)
+        let descriptors: [CInt] = [10, 11, 12]
+        self.encoder.appendFileDescriptors(descriptors)
+        let messages = Array(UnsafeControlMessageCollection(controlBytes: self.encoder.validControlBytes))
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages[1].level, SOL_SOCKET)
+        XCTAssertEqual(messages[1].type, CInt(SCM_RIGHTS))
+        let payload = messages[1].data!
+        XCTAssertEqual(payload.count, descriptors.count * MemoryLayout<CInt>.size)
+        for index in descriptors.indices {
+            XCTAssertEqual(
+                payload.loadUnaligned(fromByteOffset: index * MemoryLayout<CInt>.size, as: CInt.self),
+                descriptors[index]
+            )
+        }
+    }
+
+    func testEmptyFileDescriptorsDoNotAppendControlMessage() {
+        self.encoder.appendFileDescriptors([])
+        XCTAssertEqual(self.encoder.validControlBytes.count, 0)
+    }
+
+    func testTakeFileDescriptorsCombinesHeadersAndOnlyTakesOnce() throws {
+        let first = open("/dev/null", O_RDONLY | O_CLOEXEC)
+        let second = open("/dev/null", O_RDONLY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(first, 0)
+        XCTAssertGreaterThanOrEqual(second, 0)
+        self.encoder.appendFileDescriptors([first])
+        self.encoder.appendControlMessage(level: CInt(IPPROTO_IP), type: IP_TOS, payload: 2)
+        self.encoder.appendFileDescriptors([second])
+        var received = UnsafeReceivedControlBytes(controlBytesBuffer: self.encoderBytes!)
+        received.receivedControlMessages = UnsafeControlMessageCollection(controlBytes: self.encoder.validControlBytes)
+        let descriptors = try received.takeFileDescriptors()
+        defer { for descriptor in descriptors { try? descriptor.close() } }
+        XCTAssertEqual(try descriptors.map { try $0.withUnsafeFileDescriptor { $0 } }, [first, second])
+        XCTAssertTrue(try received.takeFileDescriptors().isEmpty)
+    }
+
+    func testIgnoredPIDFDIsClosedWithAndWithoutTruncation() throws {
+        for flags in [CInt(0), CInt(MSG_CTRUNC)] {
+            self.encoder = UnsafeOutboundControlBytes(controlBytes: self.encoderBytes!)
+            let fd = open("/dev/null", O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(fd, 0)
+            self.encoder.appendControlMessage(level: SOL_SOCKET, type: 4, payload: fd)  // SCM_PIDFD
+            var received = UnsafeReceivedControlBytes(controlBytesBuffer: self.encoderBytes!)
+            received.receivedControlMessages = UnsafeControlMessageCollection(
+                controlBytes: self.encoder.validControlBytes
+            )
+            received.receivedMessageFlags = flags
+            if flags == 0 {
+                XCTAssertTrue(try received.takeFileDescriptors().isEmpty)
+            } else {
+                XCTAssertThrowsError(try received.takeFileDescriptors())
+            }
+            XCTAssertEqual(fcntl(fd, F_GETFD), -1)
+            XCTAssertEqual(errno, EBADF)
+        }
+    }
+
+    func testTruncatedControlMessageClosesReceivedDescriptors() throws {
+        let fd = open("/dev/null", O_RDONLY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        self.encoder.appendFileDescriptors([fd])
+        var received = UnsafeReceivedControlBytes(controlBytesBuffer: self.encoderBytes!)
+        received.receivedControlMessages = UnsafeControlMessageCollection(controlBytes: self.encoder.validControlBytes)
+        received.receivedMessageFlags = CInt(MSG_CTRUNC)
+        XCTAssertThrowsError(try received.takeFileDescriptors()) { error in
+            XCTAssertEqual((error as? IOError)?.errnoCode, EMSGSIZE)
+        }
+        XCTAssertEqual(fcntl(fd, F_GETFD), -1)
+        XCTAssertNil(received.receivedControlMessages)
+    }
+    #endif
 
     private func assertBuffersNonOverlapping(
         _ b1: UnsafeMutableRawBufferPointer,

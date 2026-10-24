@@ -270,13 +270,14 @@ class Socket: BaseSocket, SocketProtocol {
 
                 let result = try withUnsafeMutablePointer(to: &messageHeader) { messageHeader in
                     try withUnsafeHandle { fd in
-                        try NIOBSDSocket.recvmsg(socket: fd, msgHdr: messageHeader, flags: 0)
+                        try NIOBSDSocket.recvmsg(socket: fd, msgHdr: messageHeader, flags: controlBytes.receiveFlags)
                     }
                 }
 
                 // Only look at the control bytes if all is good.
                 if case .processed = result {
                     controlBytes.receivedControlMessages = UnsafeControlMessageCollection(messageHeader: messageHeader)
+                    controlBytes.receivedMessageFlags = CInt(messageHeader.msg_flags)
                 }
 
                 return result
@@ -377,4 +378,59 @@ class Socket: BaseSocket, SocketProtocol {
         }
     }
 }
+
+#if os(Linux)
+extension SocketProtocol {
+    func receiveFileDescriptors(
+        pointer: UnsafeMutableRawBufferPointer
+    ) throws -> (IOResult<Int>, [NIOUnixDomainSocketDescriptor]) {
+        try withUnsafeTemporaryAllocation(
+            byteCount: UnsafeControlMessageStorage.bytesPerFileDescriptorMessage,
+            alignment: MemoryLayout<cmsghdr>.alignment
+        ) { controlBytes in
+            var address = sockaddr_storage()
+            var addressLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            var received = UnsafeReceivedControlBytes(
+                controlBytesBuffer: controlBytes,
+                receiveFlags: CInt(MSG_CMSG_CLOEXEC)
+            )
+            let result = try self.recvmsg(
+                pointer: pointer,
+                storage: &address,
+                storageLen: &addressLength,
+                controlBytes: &received
+            )
+            guard case .processed = result else { return (result, []) }
+            return (result, try received.takeFileDescriptors())
+        }
+    }
+
+    func sendFileDescriptors(
+        pointer: UnsafeRawBufferPointer,
+        descriptors: [NIOUnixDomainSocketDescriptor]
+    ) throws -> IOResult<Int> {
+        precondition(descriptors.count <= UnsafeControlMessageStorage.maximumFileDescriptors)
+        var fds: [CInt] = []
+        defer {
+            for descriptor in descriptors.prefix(fds.count) { descriptor.endBorrow() }
+        }
+        for descriptor in descriptors {
+            fds.append(try descriptor.beginBorrow())
+        }
+        return try withUnsafeTemporaryAllocation(
+            byteCount: UnsafeControlMessageStorage.bytesPerFileDescriptorMessage,
+            alignment: MemoryLayout<cmsghdr>.alignment
+        ) { controlBytes in
+            var outbound = UnsafeOutboundControlBytes(controlBytes: controlBytes)
+            outbound.appendFileDescriptors(fds)
+            return try self.sendmsg(
+                pointer: pointer,
+                destinationPtr: nil,
+                destinationSize: 0,
+                controlBytes: outbound.validControlBytes
+            )
+        }
+    }
+}
+#endif
 #endif  // !os(WASI)

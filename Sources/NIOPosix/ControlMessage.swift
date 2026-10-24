@@ -190,9 +190,12 @@ struct UnsafeReceivedControlBytes {
     var controlBytesBuffer: UnsafeMutableRawBufferPointer
     /// Set when a message is received which is using the controlBytesBuffer - the lifetime will be tied to that of `controlBytesBuffer`
     var receivedControlMessages: UnsafeControlMessageCollection?
+    var receivedMessageFlags: CInt = 0
+    let receiveFlags: CInt
 
-    init(controlBytesBuffer: UnsafeMutableRawBufferPointer) {
+    init(controlBytesBuffer: UnsafeMutableRawBufferPointer, receiveFlags: CInt = 0) {
         self.controlBytesBuffer = controlBytesBuffer
+        self.receiveFlags = receiveFlags
     }
 }
 
@@ -347,26 +350,22 @@ struct UnsafeOutboundControlBytes {
         type: CInt,
         payload: PayloadType
     ) {
-        let writableBuffer = UnsafeMutableRawBufferPointer(
-            rebasing: self.controlBytes[writePosition...]
-        )
+        withUnsafeBytes(of: payload) { bytes in
+            self.appendControlMessage(level: level, type: type, payload: bytes)
+        }
+    }
 
-        let requiredSize = NIOBSDSocketControlMessage.space(payloadSize: MemoryLayout.stride(ofValue: payload))
+    mutating func appendControlMessage(level: CInt, type: CInt, payload: UnsafeRawBufferPointer) {
+        let writableBuffer = UnsafeMutableRawBufferPointer(rebasing: self.controlBytes[self.writePosition...])
+        let requiredSize = NIOBSDSocketControlMessage.space(payloadSize: payload.count)
         precondition(writableBuffer.count >= requiredSize, "Insufficient size for cmsghdr and data")
 
-        let bufferBase = writableBuffer.baseAddress!
-        // Binding to cmsghdr is safe here as this is the only place where we bind to non-Raw.
-        let cmsghdrPtr = bufferBase.bindMemory(to: cmsghdr.self, capacity: 1)
+        // Only the header is bound to cmsghdr; payload remains raw storage.
+        let cmsghdrPtr = writableBuffer.baseAddress!.bindMemory(to: cmsghdr.self, capacity: 1)
         cmsghdrPtr.pointee.cmsg_level = level
         cmsghdrPtr.pointee.cmsg_type = type
-        cmsghdrPtr.pointee.cmsg_len = .init(
-            NIOBSDSocketControlMessage.length(payloadSize: MemoryLayout.size(ofValue: payload))
-        )
-
-        let dataPointer = NIOBSDSocketControlMessage.data(for: cmsghdrPtr)!
-        precondition(dataPointer.count >= MemoryLayout<PayloadType>.stride)
-        dataPointer.storeBytes(of: payload, as: PayloadType.self)
-
+        cmsghdrPtr.pointee.cmsg_len = .init(NIOBSDSocketControlMessage.length(payloadSize: payload.count))
+        NIOBSDSocketControlMessage.data(for: cmsghdrPtr)!.copyMemory(from: payload)
         self.writePosition += requiredSize
     }
 
@@ -379,6 +378,66 @@ struct UnsafeOutboundControlBytes {
     }
 
 }
+
+#if os(Linux)
+extension UnsafeControlMessageStorage {
+    // Linux limits a single SCM_RIGHTS message to SCM_MAX_FD descriptors.
+    static var maximumFileDescriptors: Int { 253 }
+    static var bytesPerFileDescriptorMessage: Int {
+        NIOBSDSocketControlMessage.space(payloadSize: Self.maximumFileDescriptors * MemoryLayout<CInt>.size)
+    }
+}
+
+extension UnsafeOutboundControlBytes {
+    mutating func appendFileDescriptors(_ descriptors: [CInt]) {
+        guard !descriptors.isEmpty else { return }
+        descriptors.withUnsafeBytes { bytes in
+            self.appendControlMessage(level: SOL_SOCKET, type: CInt(SCM_RIGHTS), payload: bytes)
+        }
+    }
+}
+
+extension UnsafeReceivedControlBytes {
+    /// Takes ownership once, including descriptors received before an ancillary truncation.
+    mutating func takeFileDescriptors() throws -> [NIOUnixDomainSocketDescriptor] {
+        let messages = self.receivedControlMessages
+        self.receivedControlMessages = nil
+        var descriptors: [NIOUnixDomainSocketDescriptor] = []
+        var invalid = self.receivedMessageFlags & CInt(MSG_CTRUNC) != 0
+        if let messages {
+            // SCM_PIDFD (Linux 6.5+) also installs an owned descriptor, but is not part of this API.
+            // Its value is stable even when the build's libc headers predate it.
+            let scmPIDFD: CInt = 4
+            for message in messages
+            where message.level == SOL_SOCKET && (message.type == CInt(SCM_RIGHTS) || message.type == scmPIDFD) {
+                guard let data = message.data else {
+                    invalid = true
+                    continue
+                }
+                if data.count % MemoryLayout<CInt>.size != 0 { invalid = true }
+                for offset in stride(
+                    from: 0,
+                    to: data.count - data.count % MemoryLayout<CInt>.size,
+                    by: MemoryLayout<CInt>.size
+                ) {
+                    let fd = data.loadUnaligned(fromByteOffset: offset, as: CInt.self)
+                    if message.type == CInt(SCM_RIGHTS) {
+                        descriptors.append(NIOUnixDomainSocketDescriptor(takingOwnershipOf: fd))
+                    } else {
+                        try? Posix.close(descriptor: fd)
+                    }
+                }
+            }
+        }
+        if invalid {
+            // An unsuccessful receive must not leak any descriptor installed by the kernel.
+            for descriptor in descriptors { try? descriptor.close() }
+            throw IOError(errnoCode: EMSGSIZE, reason: "truncated SCM_RIGHTS control messages")
+        }
+        return descriptors
+    }
+}
+#endif
 
 extension UnsafeOutboundControlBytes {
     /// Add a message describing the explicit congestion state if requested in metadata and valid for this protocol.
